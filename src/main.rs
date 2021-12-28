@@ -2,6 +2,7 @@ use notify::{watcher, DebouncedEvent, RecommendedWatcher, RecursiveMode, Watcher
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::*;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 use thiserror::Error;
@@ -222,6 +223,23 @@ fn restore_missing_save(path: &Path, backup_dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn watch_all(paths: &[&Path]) -> notify::Result<Receiver<DebouncedEvent>> {
+    // Create a channel to receive the events.
+    let (tx, rx) = channel();
+
+    // Automatically select the best implementation for your platform.
+    // You can also access each implementation directly e.g. INotifyWatcher.
+    let mut watcher: RecommendedWatcher = Watcher::new(tx, Duration::from_secs(2))?;
+
+    // Add a path to be watched. All files and directories at that path and
+    // below will be monitored for changes.
+    for path in paths {
+        watcher.watch(path, RecursiveMode::Recursive)?;
+    }
+
+    Ok(rx)
 }
 
 // fn handle_new_backup(path: &Path, save_dir: &Path) -> Result<()> {
