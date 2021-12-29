@@ -1,11 +1,20 @@
-use notify::{watcher, DebouncedEvent, RecommendedWatcher, RecursiveMode, Watcher};
+mod logging;
+
+use notify::{DebouncedEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::*;
 use std::sync::mpsc::{channel, Receiver};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
+
+use log::{debug, error, info, trace, warn};
+use logging::setup_logger;
+
+const BROGUE_SAVE_DIR: &str = "Library/Application Support/Brogue/Brogue CE";
+const LOCAL_BACKUP_DIR: &str = ".brogue";
+
+type Result<T> = std::result::Result<T, AppError>;
 
 #[derive(Error, Debug)]
 pub enum AppError {
@@ -21,211 +30,146 @@ pub enum AppError {
     Unknown,
 }
 
-type Result<T> = std::result::Result<T, AppError>;
+#[derive(PartialEq, Clone, Debug)]
+struct Event {
+    path: PathBuf,
+    event_type: EventType,
+    event_source: EventSource,
+}
+
+impl Event {
+    fn new(path: &PathBuf, event_type: EventType, event_source: EventSource) -> Self {
+        Self {
+            path: path.clone(),
+            event_type,
+            event_source,
+        }
+    }
+    fn save_created(path: &PathBuf) -> Self {
+        Self::new(path, EventType::Created, EventSource::Save)
+    }
+    fn save_deleted(path: &PathBuf) -> Self {
+        Self::new(path, EventType::Deleted, EventSource::Save)
+    }
+    fn backup_created(path: &PathBuf) -> Self {
+        Self::new(path, EventType::Created, EventSource::Backup)
+    }
+    fn backup_deleted(path: &PathBuf) -> Self {
+        Self::new(path, EventType::Deleted, EventSource::Backup)
+    }
+}
+
+#[derive(PartialEq, Clone, Debug, strum_macros::Display)]
+enum EventType {
+    Created,
+    Deleted,
+}
+
+#[derive(PartialEq, Clone, Debug, strum_macros::Display)]
+enum EventSource {
+    Save,
+    Backup,
+}
 
 // Basic logic:
 // ====
 // There is a save dir. New files appear (e.g. 'Saved #272472511 at depth 1 (easy).broguesave')
 // Each save file should be moved out to a backup folder
-// When it disappears from the save dir but exists in the backup dir, copy it over
-// When it is deleted from the backup dir, consider deleting itf
+// When it disappears from the save dir, but exists in the backup dir, copy it over
 //
-
-#[derive(PartialEq, Clone, Debug)]
-struct Event {
-    path: PathBuf,
-    event_type: EventType,
-}
-
-impl Event {
-    fn new(path: PathBuf, event_type: EventType) -> Self {
-        Self { path, event_type }
-    }
-}
-
-#[derive(PartialEq, Clone, Debug)]
-enum EventType {
-    SaveCreated,
-    SaveDeleted,
-    BackupCreated,
-    BackupDeleted,
-}
-
 fn main() -> Result<()> {
-    println!("backup-brogue - watches for suspended games then backs them up for later loading, even after death");
+    setup_logger().expect("Could not set up logger");
+    info!("backup-brogue - watches for suspended games then backs them up for later loading, even after death");
 
     let user_home = dirs::home_dir().ok_or_else(|| AppError::NoHomeDir)?;
-    let save_dir = user_home.join("Library/Application Support/Brogue/Brogue CE");
-    let backup_dir = user_home.join(".brogue");
+    let save_dir = user_home.join(BROGUE_SAVE_DIR);
+    let backup_dir = user_home.join(LOCAL_BACKUP_DIR);
 
     if !backup_dir.exists() {
         std::fs::create_dir_all(&backup_dir)?;
     }
 
-    let mut work_queue = VecDeque::new();
+    let mut work_queue: VecDeque<Event> = VecDeque::new();
+    work_queue.append(&mut files(&save_dir)?.iter().map(Event::save_created).collect());
+    work_queue.append(
+        &mut files(&backup_dir)?
+            .iter()
+            .map(Event::backup_created)
+            .collect(),
+    );
 
-    // treat every existing save as a new save, on startup, to make sure everything is backed up and happy
-    for entry in std::fs::read_dir(&save_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() {
-            work_queue.push_back(Event {
-                path,
-                event_type: EventType::SaveCreated,
-            });
-        }
-    }
-
-    for entry in std::fs::read_dir(&backup_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() {
-            work_queue.push_back(Event {
-                path,
-                event_type: EventType::BackupCreated,
-            });
-        }
-    }
-
-    let (save_watcher, save_rx) = watch(save_dir.clone())?;
-    let (backup_watcher, backup_rx) = watch(backup_dir.clone())?;
+    let sources: Vec<&Path> = vec![&save_dir, &backup_dir];
+    let (_watcher, rx) = watch_all(&sources).expect("could not set up watchers");
 
     loop {
         while let Some(event) = work_queue.pop_front() {
-            if event.path.extension().unwrap_or_default() != OsString::from("broguesave") {
+            let file_name = event.path.file_name().unwrap_or_default();
+            let backup_destination = backup_dir.join(&file_name);
+            let save_destination = save_dir.join(&file_name);
+
+            info!(
+                "[QUEUE]  Work queue item exists: {} {} '{}' {}ms",
+                event.event_source,
+                event.event_type,
+                file_name.to_string_lossy(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            );
+
+            match (event.event_source, event.event_type) {
+                (EventSource::Save, EventType::Created) => {
+                    // a save has appeared, so it should be backed up in case
+                    cp(&save_destination, &backup_destination, "BACKUP")?;
+                }
+                (EventSource::Save, EventType::Deleted) => {
+                    // usually the player has loaded the file, so we should restore it so it can be loaded next game
+                    cp(&backup_destination, &save_destination, "RESTORE AFTER LOAD")?;
+                }
+                (EventSource::Backup, EventType::Created) => {
+                    cp(
+                        &backup_destination,
+                        &save_destination,
+                        "RESTORE FROM BACKUP",
+                    )?;
+                }
+                (EventSource::Backup, EventType::Deleted) => {}
+            }
+        }
+
+        while let Ok(event) = rx.try_recv() {
+            info!("[WATCH]  Watcher event occurred: {:?}", event);
+            let (path, event_type) = match event {
+                DebouncedEvent::Create(path) => (path, EventType::Created),
+                DebouncedEvent::Rename(_, path) => (path, EventType::Created),
+                DebouncedEvent::Remove(path) => (path, EventType::Deleted),
+                DebouncedEvent::NoticeRemove(path) => (path, EventType::Deleted),
+                _ => continue,
+            };
+
+            let event_source = if path.starts_with(&save_dir) {
+                EventSource::Save
+            } else {
+                EventSource::Backup
+            };
+
+            if !is_brogue_save(&path) {
+                warn!(
+                    "[WATCH]  file is not a brogue save: {}",
+                    path.to_string_lossy()
+                );
                 continue;
             }
 
-            match event.event_type {
-                EventType::SaveCreated => {
-                    if !event.path.exists() {
-                        println!(
-                            "[BACKUP FAIL] save path does not exist: {}",
-                            event.path.to_string_lossy()
-                        );
-                        continue;
-                    }
-
-                    let backup_destination =
-                        backup_dir.join(event.path.file_name().unwrap_or_default());
-                    if !backup_destination.exists() {
-                        println!(
-                            "[BACKUP] {} => {}",
-                            event.path.file_name().unwrap_or_default().to_string_lossy(),
-                            backup_destination.to_string_lossy()
-                        );
-                        let out = std::fs::copy(&event.path, backup_destination)?;
-                    }
-                }
-                EventType::SaveDeleted => {
-                    let origin = backup_dir.join(event.path.file_name().unwrap_or_default());
-                    if !origin.exists() {
-                        println!(
-                            "[RESTORE FAIL] cannot restore: matching backup missing from {}",
-                            origin.to_string_lossy()
-                        );
-                        continue;
-                    }
-
-                    println!(
-                        "[RESTORE] {} => {}",
-                        origin.file_name().unwrap_or_default().to_string_lossy(),
-                        event.path.to_string_lossy()
-                    );
-                    let out = std::fs::copy(origin, &event.path)?;
-                }
-                _ => {}
-            }
-        }
-
-        while let Ok(event) = save_rx.try_recv() {
-            if let DebouncedEvent::Create(path) = event {
-                work_queue.push_back(Event::new(path, EventType::SaveCreated));
-            } else if let DebouncedEvent::Remove(path) = event {
-                work_queue.push_back(Event::new(path, EventType::SaveDeleted));
-            }
-        }
-
-        while let Ok(event) = backup_rx.try_recv() {
-            if let DebouncedEvent::Create(path) = event {
-                work_queue.push_back(Event::new(path, EventType::BackupCreated));
-            } else if let DebouncedEvent::Remove(path) = event {
-                work_queue.push_back(Event::new(path, EventType::BackupDeleted));
-            }
+            work_queue.push_back(Event::new(&path, event_type, event_source));
         }
 
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-fn watch<P: Into<PathBuf>>(path: P) -> Result<(RecommendedWatcher, Receiver<DebouncedEvent>)> {
-    let path: PathBuf = path.into();
-    if !path.exists() {
-        return Result::Err(AppError::MissingDir(path.into()));
-    }
-
-    println!("Watching dir: {}", path.to_str().unwrap_or_default());
-    let (tx, rx) = channel();
-    let mut watcher = watcher(tx, Duration::from_secs(1)).unwrap();
-    watcher.watch(path, RecursiveMode::Recursive).unwrap();
-    Ok((watcher, rx))
-}
-
-fn handle_new_save(path: &Path, backup_dir: &Path) -> Result<()> {
-    let path: PathBuf = path.into();
-
-    println!("Handling save: {:?}", path);
-
-    if !path.exists() {
-        return Ok(());
-    }
-
-    if path.extension().unwrap_or_default() != OsString::from("broguesave") {
-        println!("{:?} is not a .broguesave file", path);
-        return Ok(());
-    }
-
-    // a new save: copy it into the backup dir
-    println!("new save created at {}", path.to_str().unwrap_or_default());
-
-    let dest = backup_dir.join(path.file_name().unwrap_or_default());
-    println!("should copy to {}", dest.to_str().unwrap_or_default());
-
-    if !dest.exists() {
-        let out = std::fs::copy(path, dest)?;
-    }
-
-    Ok(())
-}
-
-fn restore_missing_save(path: &Path, backup_dir: &Path) -> Result<()> {
-    let path: PathBuf = path.into();
-
-    println!("Handling save: {:?}", path);
-
-    if !path.exists() {
-        return Ok(());
-    }
-
-    if path.extension().unwrap_or_default() != OsString::from("broguesave") {
-        println!("{:?} is not a .broguesave file", path);
-        return Ok(());
-    }
-
-    // a new save: copy it into the backup dir
-    println!("new save created at {}", path.to_str().unwrap_or_default());
-
-    let dest = backup_dir.join(path.file_name().unwrap_or_default());
-    println!("should copy to {}", dest.to_str().unwrap_or_default());
-
-    if !dest.exists() {
-        let out = std::fs::copy(path, dest)?;
-    }
-
-    Ok(())
-}
-
-fn watch_all(paths: &[&Path]) -> notify::Result<Receiver<DebouncedEvent>> {
+fn watch_all(paths: &[&Path]) -> notify::Result<(RecommendedWatcher, Receiver<DebouncedEvent>)> {
     // Create a channel to receive the events.
     let (tx, rx) = channel();
 
@@ -239,34 +183,80 @@ fn watch_all(paths: &[&Path]) -> notify::Result<Receiver<DebouncedEvent>> {
         watcher.watch(path, RecursiveMode::Recursive)?;
     }
 
-    Ok(rx)
+    Ok((watcher, rx))
 }
 
-// fn handle_new_backup(path: &Path, save_dir: &Path) -> Result<()> {
-//     let path: PathBuf = path.into();
-//
-//     println!("Handling backup: {:?}", path);
-//
-//     if !path.exists() {
-//         return Ok(());
-//     }
-//
-//     if !path.ends_with(".broguesave") {
-//         return Ok(());
-//     }
-//
-//     // a backup: copy it into the save dir
-//     println!(
-//         "new backup created at {}",
-//         path.to_str().unwrap_or_default()
-//     );
-//
-//     let dest = save_dir.join(path.file_name().unwrap_or_default());
-//     println!("should copy to {}", dest.to_str().unwrap_or_default());
-//
-//     if !dest.exists() {
-//         let out = std::fs::copy(path, dest)?;
-//     }
-//
-//     Ok(())
-// }
+fn cp(from: &Path, to: &Path, prefix: &str) -> Result<()> {
+    let from_str = from.to_string_lossy();
+    let to_str = to.to_string_lossy();
+
+    if !from.exists() {
+        error!(
+            "[{} FAIL] cannot copy: matching 'from' file '{}'",
+            prefix, from_str
+        );
+        return Ok(());
+    }
+
+    if !to.exists() {
+        info!("[{}] copying {} => {}", prefix, from_str, to_str);
+        std::fs::copy(&from, &to)?;
+    } else {
+        debug!("[{}] no need to copy {} => {}", prefix, from_str, to_str);
+    }
+
+    Ok(())
+}
+
+fn rm(from: &Path, prefix: &str) -> Result<()> {
+    let from_str = from.to_string_lossy();
+
+    if !from.exists() {
+        error!(
+            "[{} FAIL] cannot remove: matching 'from' file '{}'",
+            prefix, from_str
+        );
+        return Ok(());
+    }
+
+    if from.exists() {
+        info!("[{}] deleting {}", prefix, from_str);
+        std::fs::remove_file(&from)?;
+    }
+
+    Ok(())
+}
+
+fn is_brogue_save(path: &PathBuf) -> bool {
+    let is_file = !path.is_dir();
+    let full_path = path.to_string_lossy().to_string();
+    let extension = path
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let file_name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    info!(
+        "event file: is file? {}, extension {}, file name: {}, path: {}",
+        is_file, extension, file_name, full_path
+    );
+
+    is_file && extension == "broguesave" && file_name.starts_with("Saved")
+}
+
+fn files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut res = vec![];
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if is_brogue_save(&path) {
+            res.push(path);
+        }
+    }
+    Ok(res)
+}
