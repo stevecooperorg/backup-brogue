@@ -15,5 +15,6 @@ fern = { version = "0.5", features = ["colored"] }
 chrono = "0.4"
 strum = "0.23"
 strum_macros = "0.23"
+notify-rust = "4.5"
 thiserror = "1.0"
 tokio = { version= "1.14", features = ["full"] }

@@ -11,14 +11,27 @@ pub fn setup_logger() -> std::result::Result<(), fern::InitError> {
         .format(move |out, message, record| {
             out.finish(format_args!(
                 "{}[{}] {}",
-                chrono::Local::now().format("[%Y-%m-%d %H:%M:%S.%3f]"),
+                chrono::Local::now().format("[w%Y-%m-%d %H:%M:%S.%3f]"),
                 colors.color(record.level()),
                 message
             ))
         })
-        .level(log::LevelFilter::Debug)
+        //.level(log::LevelFilter::Debug)
+        .level(log::LevelFilter::Info)
         .chain(std::io::stdout())
         .chain(fern::log_file("output.log")?)
         .apply()?;
     Ok(())
+}
+
+#[macro_export]
+macro_rules! notify {
+    ($($arg:tt)*) => ({
+        let msg: String = format!($($arg)*);
+        Notification::new()
+            .summary("backup-brogue")
+            .body(&msg)
+            .show()
+        .expect("could not show notification");
+    })
 }

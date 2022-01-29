@@ -1,15 +1,15 @@
 mod logging;
 
 use notify::{DebouncedEvent, RecommendedWatcher, RecursiveMode, Watcher};
+use notify_rust::Notification;
 use std::collections::VecDeque;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 
-use log::{debug, error, info, trace, warn};
-use logging::setup_logger;
+use log::*;
+use logging::*;
 
 const BROGUE_SAVE_DIR: &str = "Library/Application Support/Brogue/Brogue CE";
 const LOCAL_BACKUP_DIR: &str = ".brogue";
@@ -48,14 +48,8 @@ impl Event {
     fn save_created(path: &PathBuf) -> Self {
         Self::new(path, EventType::Created, EventSource::Save)
     }
-    fn save_deleted(path: &PathBuf) -> Self {
-        Self::new(path, EventType::Deleted, EventSource::Save)
-    }
     fn backup_created(path: &PathBuf) -> Self {
         Self::new(path, EventType::Created, EventSource::Backup)
-    }
-    fn backup_deleted(path: &PathBuf) -> Self {
-        Self::new(path, EventType::Deleted, EventSource::Backup)
     }
 }
 
@@ -69,6 +63,21 @@ enum EventType {
 enum EventSource {
     Save,
     Backup,
+}
+
+fn requeue_all(
+    work_queue: &mut VecDeque<Event>,
+    save_dir: &PathBuf,
+    backup_dir: &PathBuf,
+) -> Result<()> {
+    work_queue.append(&mut files(&save_dir)?.iter().map(Event::save_created).collect());
+    work_queue.append(
+        &mut files(&backup_dir)?
+            .iter()
+            .map(Event::backup_created)
+            .collect(),
+    );
+    Ok(())
 }
 
 // Basic logic:
@@ -90,16 +99,16 @@ fn main() -> Result<()> {
     }
 
     let mut work_queue: VecDeque<Event> = VecDeque::new();
-    work_queue.append(&mut files(&save_dir)?.iter().map(Event::save_created).collect());
-    work_queue.append(
-        &mut files(&backup_dir)?
-            .iter()
-            .map(Event::backup_created)
-            .collect(),
-    );
+    requeue_all(&mut work_queue, &save_dir, &backup_dir)?;
 
     let sources: Vec<&Path> = vec![&save_dir, &backup_dir];
     let (_watcher, rx) = watch_all(&sources).expect("could not set up watchers");
+
+    let loop_delay_ms = 50;
+    let requeue_every_ms = 1_000;
+    let loop_iterations = requeue_every_ms / loop_delay_ms;
+
+    let mut loop_counter = loop_iterations;
 
     loop {
         while let Some(event) = work_queue.pop_front() {
@@ -107,7 +116,7 @@ fn main() -> Result<()> {
             let backup_destination = backup_dir.join(&file_name);
             let save_destination = save_dir.join(&file_name);
 
-            info!(
+            debug!(
                 "[QUEUE]  Work queue item exists: {} {} '{}' {}ms",
                 event.event_source,
                 event.event_type,
@@ -139,12 +148,13 @@ fn main() -> Result<()> {
         }
 
         while let Ok(event) = rx.try_recv() {
-            info!("[WATCH]  Watcher event occurred: {:?}", event);
+            // info!("[WATCH]  Watcher event occurred: {:?}", event);
             let (path, event_type) = match event {
                 DebouncedEvent::Create(path) => (path, EventType::Created),
-                DebouncedEvent::Rename(_, path) => (path, EventType::Created),
+                DebouncedEvent::Rename(path, _) => (path, EventType::Created),
                 DebouncedEvent::Remove(path) => (path, EventType::Deleted),
                 DebouncedEvent::NoticeRemove(path) => (path, EventType::Deleted),
+                DebouncedEvent::Write(path) => (path, EventType::Created),
                 _ => continue,
             };
 
@@ -155,7 +165,7 @@ fn main() -> Result<()> {
             };
 
             if !is_brogue_save(&path) {
-                warn!(
+                debug!(
                     "[WATCH]  file is not a brogue save: {}",
                     path.to_string_lossy()
                 );
@@ -165,7 +175,12 @@ fn main() -> Result<()> {
             work_queue.push_back(Event::new(&path, event_type, event_source));
         }
 
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(loop_delay_ms));
+        loop_counter -= 1;
+        if loop_counter == 0 {
+            requeue_all(&mut work_queue, &save_dir, &backup_dir)?;
+            loop_counter = loop_iterations;
+        }
     }
 }
 
@@ -200,28 +215,10 @@ fn cp(from: &Path, to: &Path, prefix: &str) -> Result<()> {
 
     if !to.exists() {
         info!("[{}] copying {} => {}", prefix, from_str, to_str);
+        notify!("[{}] copying {} => {}", prefix, from_str, to_str);
         std::fs::copy(&from, &to)?;
     } else {
         debug!("[{}] no need to copy {} => {}", prefix, from_str, to_str);
-    }
-
-    Ok(())
-}
-
-fn rm(from: &Path, prefix: &str) -> Result<()> {
-    let from_str = from.to_string_lossy();
-
-    if !from.exists() {
-        error!(
-            "[{} FAIL] cannot remove: matching 'from' file '{}'",
-            prefix, from_str
-        );
-        return Ok(());
-    }
-
-    if from.exists() {
-        info!("[{}] deleting {}", prefix, from_str);
-        std::fs::remove_file(&from)?;
     }
 
     Ok(())
@@ -241,7 +238,7 @@ fn is_brogue_save(path: &PathBuf) -> bool {
         .to_string_lossy()
         .to_string();
 
-    info!(
+    debug!(
         "event file: is file? {}, extension {}, file name: {}, path: {}",
         is_file, extension, file_name, full_path
     );
