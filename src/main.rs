@@ -38,17 +38,17 @@ struct Event {
 }
 
 impl Event {
-    fn new(path: &PathBuf, event_type: EventType, event_source: EventSource) -> Self {
+    fn new<P: Into<PathBuf>>(path: P, event_type: EventType, event_source: EventSource) -> Self {
         Self {
-            path: path.clone(),
+            path: path.into(),
             event_type,
             event_source,
         }
     }
-    fn save_created(path: &PathBuf) -> Self {
+    fn save_created<P: Into<PathBuf>>(path: P) -> Self {
         Self::new(path, EventType::Created, EventSource::Save)
     }
-    fn backup_created(path: &PathBuf) -> Self {
+    fn backup_created<P: Into<PathBuf>>(path: P) -> Self {
         Self::new(path, EventType::Created, EventSource::Backup)
     }
 }
@@ -65,14 +65,10 @@ enum EventSource {
     Backup,
 }
 
-fn requeue_all(
-    work_queue: &mut VecDeque<Event>,
-    save_dir: &PathBuf,
-    backup_dir: &PathBuf,
-) -> Result<()> {
-    work_queue.append(&mut files(&save_dir)?.iter().map(Event::save_created).collect());
+fn requeue_all(work_queue: &mut VecDeque<Event>, save_dir: &Path, backup_dir: &Path) -> Result<()> {
+    work_queue.append(&mut files(save_dir)?.iter().map(Event::save_created).collect());
     work_queue.append(
-        &mut files(&backup_dir)?
+        &mut files(backup_dir)?
             .iter()
             .map(Event::backup_created)
             .collect(),
@@ -90,7 +86,7 @@ fn main() -> Result<()> {
     setup_logger().expect("Could not set up logger");
     info!("backup-brogue - watches for suspended games then backs them up for later loading, even after death");
 
-    let user_home = dirs::home_dir().ok_or_else(|| AppError::NoHomeDir)?;
+    let user_home = dirs::home_dir().ok_or(AppError::NoHomeDir)?;
     let save_dir = user_home.join(BROGUE_SAVE_DIR);
     let backup_dir = user_home.join(LOCAL_BACKUP_DIR);
 
@@ -224,7 +220,7 @@ fn cp(from: &Path, to: &Path, prefix: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_brogue_save(path: &PathBuf) -> bool {
+fn is_brogue_save(path: &Path) -> bool {
     let is_file = !path.is_dir();
     let full_path = path.to_string_lossy().to_string();
     let extension = path
