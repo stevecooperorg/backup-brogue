@@ -2587,3 +2587,4 @@
 [w2022-01-29 19:43:28.052][[32mINFO[0m] backup-brogue - watches for suspended games then backs them up for later loading, even after death
 [w2022-01-29 19:57:13.871][[32mINFO[0m] backup-brogue - watches for suspended games then backs them up for later loading, even after death
 [w2022-01-29 19:58:05.321][[32mINFO[0m] [RESTORE AFTER LOAD] copying /Users/steve/.brogue/Saved #290486458 at depth 4 (easy) (2).broguesave => /Users/steve/Library/Application Support/Brogue/Brogue CE/Saved #290486458 at depth 4 (easy) (2).broguesave
+[w2022-02-26 19:26:22.704][[32mINFO[0m] backup-brogue - watches for suspended games then backs them up for later loading, even after death
