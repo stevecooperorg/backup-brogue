@@ -3,6 +3,7 @@ mod logging;
 use notify::{DebouncedEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use notify_rust::Notification;
 use std::collections::VecDeque;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, SystemTime};
@@ -221,25 +222,9 @@ fn cp(from: &Path, to: &Path, prefix: &str) -> Result<()> {
 }
 
 fn is_brogue_save(path: &Path) -> bool {
-    let is_file = !path.is_dir();
-    let full_path = path.to_string_lossy().to_string();
-    let extension = path
-        .extension()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let file_name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    debug!(
-        "event file: is file? {}, extension {}, file name: {}, path: {}",
-        is_file, extension, file_name, full_path
-    );
-
-    is_file && extension == "broguesave" && file_name.starts_with("Saved")
+    !path.is_dir()
+        && path.extension() == Some(OsStr::new("broguesave"))
+        && path.file_name() == Some(OsStr::new("Saved"))
 }
 
 fn files(dir: &Path) -> Result<Vec<PathBuf>> {
