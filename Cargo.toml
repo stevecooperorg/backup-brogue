@@ -19,3 +19,4 @@ notify-rust = "4.5"
 thiserror = "1.0"
 tokio = { version= "1.14", features = ["full"] }
 crossterm = "0.23"
+tui = "0.17"
