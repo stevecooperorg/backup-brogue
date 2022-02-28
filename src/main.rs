@@ -105,8 +105,9 @@ fn run_app<B: Backend>(
                         app.delete_state = DeleteState::AwaitingIndex;
                     }
                     KeyCode::Char(c) => {
-                        if app.delete_state == DeleteState::AwaitingIndex && c.is_ascii_digit() {
-                            let idx: usize = c.to_string().parse().unwrap();
+                        if app.delete_state == DeleteState::AwaitingIndex && c.is_ascii_alphabetic()
+                        {
+                            let idx = ((c as u8) - b'a') as usize;
                             app.delete_state = DeleteState::Delete(idx);
                         }
                     }
@@ -120,6 +121,10 @@ fn run_app<B: Backend>(
             last_tick = Instant::now();
         }
     }
+}
+
+fn letter(idx: usize) -> char {
+    (b'a' + idx as u8) as char
 }
 
 fn ui<B: Backend>(f: &mut Frame<B>, app: &App) {
@@ -136,18 +141,23 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &App) {
 
     let delete_state_description: String = match &app.delete_state {
         DeleteState::NotDeleting => "press 'd' to delete a save game".to_string(),
-        DeleteState::AwaitingIndex => "pres a number to choose a game to delete".to_string(),
+        DeleteState::AwaitingIndex => {
+            "press a number to choose a game to delete, or ESC to cancel".to_string()
+        }
         DeleteState::Delete(idx) => format!("deleting {}", idx),
     };
 
-    let state_descrition = vec![Spans::from(delete_state_description)];
+    let state_descrition = vec![
+        Spans::from(delete_state_description),
+        Spans::from("press 'q' to quit"),
+    ];
 
     let file_spans: Vec<_> = app
         .state
         .saves
         .iter()
         .enumerate()
-        .map(|(idx, s)| Spans::from(Span::raw(format!("{}. {}", idx.to_string(), s.to_string()))))
+        .map(|(idx, s)| Spans::from(Span::raw(format!("{}) {}", letter(idx), s.to_string()))))
         .collect();
 
     let create_block = |title| {

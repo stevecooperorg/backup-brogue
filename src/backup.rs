@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[derive(PartialEq)]
 pub enum DeleteState {
@@ -119,7 +119,7 @@ impl Save {
         }
     }
 
-    fn sort_by(&self) -> SystemTime {
+    fn sort_by(&self) -> Duration {
         match self {
             Save::OriginalFileOnly(x) => sort_by(x),
             Save::BackupFileOnly(x) => sort_by(x),
@@ -135,8 +135,11 @@ fn key(path: &Path) -> String {
         .to_string()
 }
 
-fn sort_by(path: &Path) -> SystemTime {
-    path.metadata().unwrap().modified().unwrap()
+fn sort_by(path: &Path) -> Duration {
+    let modified = path.metadata().unwrap().modified().expect("get file mod");
+    SystemTime::now()
+        .duration_since(modified)
+        .expect("duration_since")
 }
 
 impl Display for Save {
